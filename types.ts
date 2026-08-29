@@ -1,0 +1,62 @@
+export interface Env {
+  DB: D1Database;
+  PERMS_CACHE: KVNamespace;
+  GAME_LINK: DurableObjectNamespace;
+  ENVIRONMENT: string;
+}
+
+// Hono context variable bag — lets c.get("game") / c.set("game", ...) type-check
+// without a cast at every call site.
+export interface AppVariables {
+  game: Game;
+}
+
+export interface Game {
+  id: string;
+  org_id: string;
+  name: string;
+  roblox_universe_id: number;
+  roblox_place_id: number | null;
+  api_key_hash: string;
+}
+
+export interface StaffMember {
+  id: string;
+  org_id: string;
+  roblox_user_id: number;
+  roblox_username: string;
+  discord_user_id: string | null;
+  rank_id: string | null;
+  rank_override: number; // sqlite boolean (0/1)
+  status: string;
+  last_group_rank_id: number | null;
+  sync_status: "synced" | "unmapped" | "left_group";
+  last_synced_at: number | null;
+}
+
+export interface Org {
+  id: string;
+  name: string;
+  roblox_group_id: number;
+  discord_guild_id: string | null;
+}
+
+export interface Rank {
+  id: string;
+  org_id: string;
+  name: string;
+  roblox_rank_id: number | null;
+  priority: number;
+  permissions: string; // JSON-encoded string[]
+  color: string | null;
+}
+
+export interface QueuedCommand {
+  id: string;
+  game_id: string;
+  command: string;
+  args: string; // JSON
+  issued_by_staff_id: string | null;
+  status: "pending" | "delivered" | "failed";
+  created_at: number;
+}
