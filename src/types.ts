@@ -3,12 +3,23 @@ export interface Env {
   PERMS_CACHE: KVNamespace;
   GAME_LINK: DurableObjectNamespace;
   ENVIRONMENT: string;
+
+  // Roblox OAuth app (registered once for the whole RoarAdmin deployment)
+  ROBLOX_OAUTH_CLIENT_ID: string;
+  ROBLOX_OAUTH_CLIENT_SECRET: string; // wrangler secret
+  ROBLOX_OAUTH_REDIRECT_URI: string;
+
+  DASHBOARD_URL: string; // Pages frontend origin, e.g. https://roaradmin.pages.dev
+
+  SESSION_SECRET: string;   // wrangler secret -- signs dashboard session tokens
+  ENCRYPTION_KEY: string;   // wrangler secret -- encrypts stored org API keys
 }
 
 // Hono context variable bag — lets c.get("game") / c.set("game", ...) type-check
 // without a cast at every call site.
 export interface AppVariables {
   game: Game;
+  session: StaffSessionContext;
 }
 
 export interface Game {
@@ -28,8 +39,10 @@ export interface StaffMember {
   discord_user_id: string | null;
   rank_id: string | null;
   rank_override: number; // sqlite boolean (0/1)
+  is_org_owner: number; // sqlite boolean (0/1)
   status: string;
   last_group_rank_id: number | null;
+  roblox_membership_id: string | null;
   sync_status: "synced" | "unmapped" | "left_group";
   last_synced_at: number | null;
 }
@@ -39,6 +52,22 @@ export interface Org {
   name: string;
   roblox_group_id: number;
   discord_guild_id: string | null;
+}
+
+export interface OrgRobloxCredential {
+  org_id: string;
+  api_key_ciphertext: string;
+  api_key_iv: string;
+  added_by_staff_id: string | null;
+  last_validated_at: number | null;
+  last_validation_ok: number | null;
+}
+
+// Extends AppVariables below once a request has passed requireStaffSession.
+export interface StaffSessionContext {
+  staffMemberId: string;
+  orgId: string;
+  robloxUserId: number;
 }
 
 export interface Rank {
