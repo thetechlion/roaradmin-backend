@@ -1,5 +1,7 @@
 import type { Context, Next } from "hono";
-import type { Env, Game, AppVariables } from "./types";
+import type { Env, Game, AppVariables, OrgRobloxCredential } from "./types";
+import { verifySessionToken } from "./session";
+import { decryptSecret } from "./crypto";
 
 type AppContext = Context<{ Bindings: Env; Variables: AppVariables }>;
 
@@ -46,14 +48,42 @@ export async function requireGameKey(c: AppContext, next: Next) {
   await next();
 }
 
-// Placeholder for the dashboard side: staff sign in with Roblox OAuth2,
-// we issue our own short-lived signed session token (JWT or similar) and
-// validate it here. Filled in when we build the dashboard auth flow.
+// Dashboard staff auth. Session tokens are issued at the end of the Roblox
+// OAuth callback (see /auth/roblox/callback in index.ts) and sent back as
+// `Authorization: Bearer <token>` on every dashboard API call.
 export async function requireStaffSession(c: AppContext, next: Next) {
-  const sessionToken = c.req.header("Authorization")?.replace("Bearer ", "");
-  if (!sessionToken) {
+  const token = c.req.header("Authorization")?.replace("Bearer ", "");
+  if (!token) {
     return c.json({ error: "not_authenticated" }, 401);
   }
-  // TODO: verify signed session token, look up staff_member, attach to context
+
+  const payload = await verifySessionToken(token, c.env.SESSION_SECRET);
+  if (!payload) {
+    return c.json({ error: "invalid_or_expired_session" }, 401);
+  }
+
+  // A session is always scoped to one org (the one the user selected on
+  // login); routes under /orgs/:orgId must match, so a stolen/reused token
+  // for org A can't be replayed against org B.
+  const orgIdParam = c.req.param("orgId");
+  if (orgIdParam && orgIdParam !== payload.orgId) {
+    return c.json({ error: "org_mismatch" }, 403);
+  }
+
+  c.set("session", {
+    staffMemberId: payload.staffMemberId,
+    orgId: payload.orgId,
+    robloxUserId: payload.robloxUserId,
+  });
   await next();
+}
+
+/** Decrypts and returns an org's stored Roblox Open Cloud API key, or null if none is set. */
+export async function getOrgRobloxApiKey(c: AppContext, orgId: string): Promise<string | null> {
+  const cred = await c.env.DB.prepare("SELECT * FROM org_roblox_credentials WHERE org_id = ?")
+    .bind(orgId)
+    .first<OrgRobloxCredential>();
+  if (!cred) return null;
+
+  return decryptSecret(cred.api_key_ciphertext, cred.api_key_iv, c.env.ENCRYPTION_KEY);
 }
