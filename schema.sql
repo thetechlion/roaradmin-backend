@@ -63,6 +63,38 @@ CREATE TABLE staff_members (
 );
 
 -- ─────────────────────────────────────────────
+-- RoarAdmin login accounts (username + password, verified via a one-time
+-- code placed in the user's Roblox profile description). Separate from
+-- staff_members: an account is "who can log in", staff_members is "what
+-- org(s) they belong to and at what rank".
+-- ─────────────────────────────────────────────
+
+CREATE TABLE user_accounts (
+  id            TEXT PRIMARY KEY,           -- uuid
+  roblox_user_id INTEGER NOT NULL UNIQUE,
+  roblox_username TEXT NOT NULL,            -- most recently seen username, for display/login-by-username
+  password_salt TEXT NOT NULL,              -- base64
+  password_hash TEXT NOT NULL,              -- base64
+  password_iterations INTEGER NOT NULL,
+  created_at    INTEGER NOT NULL DEFAULT (unixepoch()),
+  last_login_at INTEGER
+);
+
+-- Deliberately NOT in user_accounts until verification succeeds -- per spec,
+-- an unverified signup attempt must not exist "in the records" yet. One row
+-- per in-progress signup; a repeat signup attempt for the same Roblox user
+-- overwrites their previous pending attempt.
+CREATE TABLE pending_signups (
+  roblox_user_id INTEGER PRIMARY KEY,
+  roblox_username TEXT NOT NULL,
+  password_salt TEXT NOT NULL,
+  password_hash TEXT NOT NULL,
+  password_iterations INTEGER NOT NULL,
+  verification_token TEXT NOT NULL,         -- "RA-1234ABCD"
+  expires_at    INTEGER NOT NULL,
+  created_at    INTEGER NOT NULL DEFAULT (unixepoch())
+);
+-- ─────────────────────────────────────────────
 -- Roblox Open Cloud API key per org, used to write group-rank changes
 -- (promotions/demotions) and to read group membership under the group
 -- member-list privacy setting. Encrypted at rest -- see src/crypto.ts.
