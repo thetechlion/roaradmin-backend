@@ -23,7 +23,12 @@ new_classes = ["GameLink"]
 
 [vars]
 ENVIRONMENT = "development"
+# CORS: the Pages dashboard's origin, e.g. https://roaradmin.pages.dev
+DASHBOARD_ORIGIN = "https://roaradmin.leocool.workers.dev"
 
+# Secrets (never go in this file) -- set with:
+#   wrangler secret put SESSION_SECRET          (any long random string)
+#   wrangler secret put ENCRYPTION_KEY           (base64, e.g. `openssl rand -base64 32`)
 [triggers]
 # Fallback poll: catches rank changes made directly in Roblox (outside the
 # dashboard), which don't go through the instant push-sync path.
