@@ -58,6 +58,27 @@ export interface OrgRobloxCredential {
   last_validated_at: number | null;
   last_validation_ok: number | null;
 }
+export interface UserAccount {
+  id: string;
+  roblox_user_id: number;
+  roblox_username: string;
+  password_salt: string;
+  password_hash: string;
+  password_iterations: number;
+  created_at: number;
+  last_login_at: number | null;
+}
+
+export interface PendingSignup {
+  roblox_user_id: number;
+  roblox_username: string;
+  password_salt: string;
+  password_hash: string;
+  password_iterations: number;
+  verification_token: string;
+  expires_at: number;
+  created_at: number;
+}
 
 // Extends AppVariables below once a request has passed requireStaffSession.
 export interface StaffSessionContext {
