@@ -49,15 +49,33 @@ CREATE TABLE staff_members (
   discord_user_id TEXT,
   rank_id       TEXT REFERENCES ranks(id),
   rank_override BOOLEAN NOT NULL DEFAULT 0, -- true = don't auto-resync this user's rank from the group
+  is_org_owner  BOOLEAN NOT NULL DEFAULT 0, -- Roblox group owner (rank 255); implicit full dashboard access
   status        TEXT NOT NULL DEFAULT 'active', -- active | loa | suspended | terminated
   joined_staff_at INTEGER NOT NULL DEFAULT (unixepoch()),
   -- Group-sync bookkeeping. A user stays on their last known local `rank_id`
   -- until an admin resolves an unmapped group rank -- we never silently
   -- desync someone's permissions.
   last_group_rank_id INTEGER,               -- most recent Roblox group role id seen for this user
+  roblox_membership_id TEXT,                -- Open Cloud v2 "memberships/{id}" resource id, cached for writes
   sync_status   TEXT NOT NULL DEFAULT 'synced', -- synced | unmapped | left_group
   last_synced_at INTEGER,
   UNIQUE(org_id, roblox_user_id)
+);
+
+-- ─────────────────────────────────────────────
+-- Roblox Open Cloud API key per org, used to write group-rank changes
+-- (promotions/demotions) and to read group membership under the group
+-- member-list privacy setting. Encrypted at rest -- see src/crypto.ts.
+-- ─────────────────────────────────────────────
+
+CREATE TABLE org_roblox_credentials (
+  org_id        TEXT PRIMARY KEY REFERENCES orgs(id) ON DELETE CASCADE,
+  api_key_ciphertext TEXT NOT NULL,         -- base64 AES-GCM ciphertext
+  api_key_iv    TEXT NOT NULL,              -- base64 IV used for the above
+  added_by_staff_id TEXT REFERENCES staff_members(id),
+  last_validated_at INTEGER,
+  last_validation_ok BOOLEAN,
+  created_at    INTEGER NOT NULL DEFAULT (unixepoch())
 );
 
 -- ─────────────────────────────────────────────
