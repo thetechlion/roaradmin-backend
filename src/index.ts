@@ -1,5 +1,7 @@
 import { Hono } from "hono";
-import type { Env, AppVariables, Rank, StaffMember, QueuedCommand, Org } from "./types";
+import type { Context } from "hono";
+import { cors } from "hono/cors";
+import type { Env, AppVariables, Rank, StaffMember, QueuedCommand, Org, UserAccount, PendingSignup } from "./types";
 import { requireGameKey, requireStaffSession, getOrgRobloxApiKey } from "./auth";
 import { syncOrgGroup, syncSingleStaffMember, MissingApiKeyError } from "./groupSync";
 import {
@@ -10,13 +12,9 @@ import {
   OpenCloudError,
 } from "./openCloudGroups";
 import { encryptSecret } from "./crypto";
-import {
-  generatePkcePair,
-  buildAuthorizeUrl,
-  exchangeCodeForToken,
-  getUserInfo,
-  getUserGroupRoles,
-} from "./oauth";
+import { resolveUsernameToId, getUserBio, getUserGroupRoles } from "./robloxUsers";
+import { hashPassword, verifyPassword, isPasswordAcceptable } from "./password";
+import { generateVerificationToken } from "./verificationToken";
 import { createSessionToken, createSetupToken, verifySetupToken } from "./session";
 
 export { GameLink } from "./gameLink";
@@ -24,6 +22,11 @@ export { GameLink } from "./gameLink";
 const app = new Hono<{ Bindings: Env; Variables: AppVariables }>();
 const SESSION_TTL_SECONDS = 60 * 60 * 8; // 8 hours
 const SETUP_TOKEN_TTL_SECONDS = 60 * 30; // 30 minutes
+const SIGNUP_TOKEN_TTL_SECONDS = 60 * 30; // 30 minutes to paste the code in their bio and verify
+const MAX_LOGIN_ATTEMPTS = 5;
+const LOGIN_LOCKOUT_SECONDS = 15 * 60;
+
+app.use("*", async (c, next) => cors({ origin: c.env.DASHBOARD_ORIGIN, credentials: true })(c, next));
 
 app.get("/health", (c) => c.json({ ok: true, env: c.env.ENVIRONMENT }));
 
@@ -161,51 +164,21 @@ game.post("/time/leave", async (c) => {
   return c.json({ ok: true });
 });
 
-// ── Roblox OAuth 2.0 login ────────────────────────────────────────────────
-// One RoarAdmin-wide OAuth app (registered once in the Roblox Creator
-// Dashboard with the `openid profile` scopes) handles login for every org's
-// dashboard users. See src/oauth.ts for setup notes.
+// ── RoarAdmin login (username + password) ─────────────────────────────────
+// No Roblox OAuth -- identity is proven once, at signup, by having the user
+// paste a one-time code into their Roblox profile description. Login after
+// that is a normal username+password check against user_accounts.
 
-app.get("/auth/roblox/login", async (c) => {
-  const { verifier, challenge } = await generatePkcePair();
-  const state = crypto.randomUUID();
-
-  // Short-lived: the PKCE verifier only needs to survive the redirect round trip.
-  await c.env.PERMS_CACHE.put(`oauth_state:${state}`, verifier, { expirationTtl: 600 });
-
-  const url = buildAuthorizeUrl({
-    clientId: c.env.ROBLOX_OAUTH_CLIENT_ID,
-    redirectUri: c.env.ROBLOX_OAUTH_REDIRECT_URI,
-    state,
-    codeChallenge: challenge,
-  });
-
-  return c.redirect(url);
-});
-
-app.get("/auth/roblox/callback", async (c) => {
-  const code = c.req.query("code");
-  const state = c.req.query("state");
-  if (!code || !state) return c.json({ error: "missing_code_or_state" }, 400);
-
-  const stateKey = `oauth_state:${state}`;
-  const verifier = await c.env.PERMS_CACHE.get(stateKey);
-  if (!verifier) return c.json({ error: "invalid_or_expired_state" }, 400);
-  await c.env.PERMS_CACHE.delete(stateKey);
-
-  const tokens = await exchangeCodeForToken({
-    clientId: c.env.ROBLOX_OAUTH_CLIENT_ID,
-    clientSecret: c.env.ROBLOX_OAUTH_CLIENT_SECRET,
-    redirectUri: c.env.ROBLOX_OAUTH_REDIRECT_URI,
-    code,
-    codeVerifier: verifier,
-  });
-
-  const userInfo = await getUserInfo(tokens.access_token);
-  const robloxUserId = Number(userInfo.sub);
-
-  // "Owned groups" = groups where this user's role has rank 255 (Owner).
-  const allGroupRoles = await getUserGroupRoles(userInfo.sub);
+/** Resolves which orgs this Roblox user can access after a successful login/verify,
+ * issuing a session token for existing orgs and a setup token for owned groups
+ * that don't have an org yet. Same idea as the old OAuth callback, just called
+ * from a password login instead of a redirect. */
+async function buildAccessResponse(
+  c: Context<{ Bindings: Env; Variables: AppVariables }>,
+  robloxUserId: number,
+  username: string
+) {
+  const allGroupRoles = await getUserGroupRoles(robloxUserId);
   const ownedGroups = allGroupRoles.filter((g) => g.role.rank === 255);
 
   const groups: Array<{
@@ -229,16 +202,13 @@ app.get("/auth/roblox/callback", async (c) => {
         .bind(org.id, robloxUserId)
         .first<StaffMember>();
 
-      // The group owner always gets dashboard access, even if group-sync
-      // hasn't run yet or their rank isn't mapped -- rank_override keeps
-      // them out of the auto-resync path entirely.
       if (!staff) {
         const staffId = crypto.randomUUID();
         await c.env.DB.prepare(
           `INSERT INTO staff_members (id, org_id, roblox_user_id, roblox_username, is_org_owner, rank_override)
            VALUES (?, ?, ?, ?, 1, 1)`
         )
-          .bind(staffId, org.id, robloxUserId, userInfo.preferred_username ?? `user_${robloxUserId}`)
+          .bind(staffId, org.id, robloxUserId, username)
           .run();
         staff = { id: staffId } as StaffMember;
       }
@@ -268,18 +238,142 @@ app.get("/auth/roblox/callback", async (c) => {
     }
   }
 
-  // Hand off to the dashboard (a separate Pages app) via URL fragment, not a
-  // query string -- fragments never leave the browser, so these one-time
-  // tokens never hit any server log (ours or Roblox's referrer chain).
-  const payload = { robloxUserId, username: userInfo.preferred_username, groups };
-  const redirectUrl = `${c.env.DASHBOARD_URL}/auth/callback#data=${encodeURIComponent(JSON.stringify(payload))}`;
-  return c.redirect(redirectUrl);
+  return { robloxUserId, username, groups };
+}
+
+// Step 1: submit desired username + password. Nothing is created yet --
+// returns a one-time verification code to paste into the Roblox bio.
+app.post("/auth/signup/start", async (c) => {
+  const body = await c.req.json<{ robloxUsername: string; password: string; confirmPassword: string }>();
+
+  if (!body.robloxUsername || !body.password) {
+    return c.json({ error: "missing_fields" }, 400);
+  }
+  if (body.password !== body.confirmPassword) {
+    return c.json({ error: "passwords_do_not_match" }, 400);
+  }
+  if (!isPasswordAcceptable(body.password)) {
+    return c.json({ error: "password_too_weak", detail: "Use at least 8 characters." }, 400);
+  }
+
+  const robloxUser = await resolveUsernameToId(body.robloxUsername);
+  if (!robloxUser) {
+    return c.json({ error: "roblox_user_not_found" }, 404);
+  }
+
+  const existingAccount = await c.env.DB.prepare("SELECT id FROM user_accounts WHERE roblox_user_id = ?")
+    .bind(robloxUser.id)
+    .first();
+  if (existingAccount) {
+    return c.json({ error: "account_already_exists" }, 409);
+  }
+
+  const { salt, hash, iterations } = await hashPassword(body.password);
+  const token = generateVerificationToken();
+  const expiresAt = Math.floor(Date.now() / 1000) + SIGNUP_TOKEN_TTL_SECONDS;
+
+  await c.env.DB.prepare(
+    `INSERT INTO pending_signups
+      (roblox_user_id, roblox_username, password_salt, password_hash, password_iterations, verification_token, expires_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT(roblox_user_id) DO UPDATE SET
+       roblox_username = excluded.roblox_username,
+       password_salt = excluded.password_salt,
+       password_hash = excluded.password_hash,
+       password_iterations = excluded.password_iterations,
+       verification_token = excluded.verification_token,
+       expires_at = excluded.expires_at,
+       created_at = unixepoch()`
+  )
+    .bind(robloxUser.id, robloxUser.name, salt, hash, iterations, token, expiresAt)
+    .run();
+
+  return c.json({
+    robloxUserId: robloxUser.id,
+    robloxUsername: robloxUser.name,
+    verificationToken: token,
+    instructions: `Paste "${token}" anywhere in your Roblox profile description (About section), then click verify. You can remove it again once verification succeeds.`,
+    expiresAt,
+  });
+});
+
+// Step 2: check the Roblox bio for the code. Only now does the account get
+// created -- an incomplete verification leaves nothing in user_accounts.
+app.post("/auth/signup/verify", async (c) => {
+  const { robloxUsername } = await c.req.json<{ robloxUsername: string }>();
+  if (!robloxUsername) return c.json({ error: "missing_roblox_username" }, 400);
+
+  const robloxUser = await resolveUsernameToId(robloxUsername);
+  if (!robloxUser) return c.json({ error: "roblox_user_not_found" }, 404);
+
+  const pending = await c.env.DB.prepare("SELECT * FROM pending_signups WHERE roblox_user_id = ?")
+    .bind(robloxUser.id)
+    .first<PendingSignup>();
+  if (!pending) return c.json({ error: "no_pending_signup" }, 404);
+
+  if (pending.expires_at < Math.floor(Date.now() / 1000)) {
+    await c.env.DB.prepare("DELETE FROM pending_signups WHERE roblox_user_id = ?").bind(robloxUser.id).run();
+    return c.json({ error: "verification_expired", detail: "Start signup again to get a new code." }, 410);
+  }
+
+  const bio = await getUserBio(robloxUser.id);
+  if (!bio.includes(pending.verification_token)) {
+    return c.json({ error: "code_not_found_in_bio" }, 422);
+  }
+
+  const accountId = crypto.randomUUID();
+  await c.env.DB.prepare(
+    `INSERT INTO user_accounts
+      (id, roblox_user_id, roblox_username, password_salt, password_hash, password_iterations)
+     VALUES (?, ?, ?, ?, ?, ?)`
+  )
+    .bind(accountId, pending.roblox_user_id, pending.roblox_username, pending.password_salt, pending.password_hash, pending.password_iterations)
+    .run();
+
+  await c.env.DB.prepare("DELETE FROM pending_signups WHERE roblox_user_id = ?").bind(robloxUser.id).run();
+
+  return c.json({ ok: true, message: "Account verified -- you can remove the code from your bio now and log in." });
+});
+
+app.post("/auth/login", async (c) => {
+  const { robloxUsername, password } = await c.req.json<{ robloxUsername: string; password: string }>();
+  if (!robloxUsername || !password) return c.json({ error: "missing_fields" }, 400);
+
+  const robloxUser = await resolveUsernameToId(robloxUsername);
+  if (!robloxUser) return c.json({ error: "invalid_credentials" }, 401); // don't reveal which part was wrong
+
+  const lockoutKey = `login_attempts:${robloxUser.id}`;
+  const attempts = Number((await c.env.PERMS_CACHE.get(lockoutKey)) ?? "0");
+  if (attempts >= MAX_LOGIN_ATTEMPTS) {
+    return c.json({ error: "too_many_attempts", detail: "Try again in 15 minutes." }, 429);
+  }
+
+  const account = await c.env.DB.prepare("SELECT * FROM user_accounts WHERE roblox_user_id = ?")
+    .bind(robloxUser.id)
+    .first<UserAccount>();
+
+  const valid =
+    !!account &&
+    (await verifyPassword(password, account.password_salt, account.password_hash, account.password_iterations));
+
+  if (!valid) {
+    await c.env.PERMS_CACHE.put(lockoutKey, String(attempts + 1), { expirationTtl: LOGIN_LOCKOUT_SECONDS });
+    return c.json({ error: "invalid_credentials" }, 401);
+  }
+
+  await c.env.PERMS_CACHE.delete(lockoutKey);
+  await c.env.DB.prepare("UPDATE user_accounts SET last_login_at = unixepoch(), roblox_username = ? WHERE id = ?")
+    .bind(robloxUser.name, account!.id)
+    .run();
+
+  const access = await buildAccessResponse(c, robloxUser.id, robloxUser.name);
+  return c.json(access);
 });
 
 // ── Org bootstrap ─────────────────────────────────────────────────────────
-// Creates a new org for a group the user just proved (via OAuth) they own.
-// Authorized by a short-lived setup token instead of a staff session, since
-// no staff_members row -- or org -- exists yet at this point.
+// Creates a new org for a group the user just proved (by logging in as its
+// Roblox owner) they own. Authorized by a short-lived setup token instead of
+// a staff session, since no staff_members row -- or org -- exists yet.
 
 app.post("/orgs", async (c) => {
   const token = c.req.header("Authorization")?.replace("Bearer ", "");
