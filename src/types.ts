@@ -4,12 +4,8 @@ export interface Env {
   GAME_LINK: DurableObjectNamespace;
   ENVIRONMENT: string;
 
-  // Roblox OAuth app (registered once for the whole RoarAdmin deployment)
-  ROBLOX_OAUTH_CLIENT_ID: string;
-  ROBLOX_OAUTH_CLIENT_SECRET: string; // wrangler secret
-  ROBLOX_OAUTH_REDIRECT_URI: string;
-
-  DASHBOARD_URL: string; // Pages frontend origin, e.g. https://roaradmin.pages.dev
+  // Dashboard (Pages) origin, for CORS -- e.g. https://roaradmin.pages.dev
+  DASHBOARD_ORIGIN: string;
 
   SESSION_SECRET: string;   // wrangler secret -- signs dashboard session tokens
   ENCRYPTION_KEY: string;   // wrangler secret -- encrypts stored org API keys
