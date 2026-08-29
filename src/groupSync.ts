@@ -1,7 +1,28 @@
-import type { Env, Org, Rank, StaffMember } from "./types";
-import { getGroupRoles, iterateUsersInRole, getUserRoleInGroup } from "./robloxGroup";
+import type { Env, Org, Rank, StaffMember, OrgRobloxCredential } from "./types";
+import {
+  iterateMemberships,
+  findMembershipForUser,
+  membershipIdFromPath,
+  roleIdFromPath,
+  OpenCloudError,
+} from "./openCloudGroups";
+import { decryptSecret } from "./crypto";
 
 const now = () => Math.floor(Date.now() / 1000);
+
+export class MissingApiKeyError extends Error {
+  constructor(orgId: string) {
+    super(`Org ${orgId} has no Roblox API key on file -- group sync skipped`);
+  }
+}
+
+async function getOrgApiKey(env: Env, org: Org): Promise<string> {
+  const cred = await env.DB.prepare("SELECT * FROM org_roblox_credentials WHERE org_id = ?")
+    .bind(org.id)
+    .first<OrgRobloxCredential>();
+  if (!cred) throw new MissingApiKeyError(org.id);
+  return decryptSecret(cred.api_key_ciphertext, cred.api_key_iv, env.ENCRYPTION_KEY);
+}
 
 async function getMappedRanks(env: Env, orgId: string): Promise<Rank[]> {
   const { results } = await env.DB.prepare(
@@ -17,7 +38,7 @@ async function upsertStaffForRank(
   org: Org,
   rank: Rank,
   robloxUserId: number,
-  username: string,
+  membershipId: string,
   robloxRoleId: number
 ) {
   const existing = await env.DB.prepare(
@@ -28,14 +49,17 @@ async function upsertStaffForRank(
 
   if (!existing) {
     // Brand new staff member: they hold a group role that's mapped to a
-    // configured rank, so bring them in as `synced`.
+    // configured rank, so bring them in as `synced`. Username isn't
+    // returned by the v2 membership object -- backfilled lazily by
+    // whichever route next needs to display it, stored as a placeholder
+    // in the meantime.
     const id = crypto.randomUUID();
     await env.DB.prepare(
       `INSERT INTO staff_members
-        (id, org_id, roblox_user_id, roblox_username, rank_id, last_group_rank_id, sync_status, last_synced_at)
-       VALUES (?, ?, ?, ?, ?, ?, 'synced', ?)`
+        (id, org_id, roblox_user_id, roblox_username, rank_id, last_group_rank_id, roblox_membership_id, sync_status, last_synced_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, 'synced', ?)`
     )
-      .bind(id, org.id, robloxUserId, username, rank.id, robloxRoleId, now())
+      .bind(id, org.id, robloxUserId, `user_${robloxUserId}`, rank.id, robloxRoleId, membershipId, now())
       .run();
 
     await env.DB.prepare(
@@ -47,17 +71,16 @@ async function upsertStaffForRank(
     return;
   }
 
-  // rank_override users are explicitly opted out of auto-resync — never touch them.
-  if (existing.rank_override) return;
+  if (existing.rank_override) return; // opted out of auto-resync
 
   const rankChanged = existing.rank_id !== rank.id;
 
   await env.DB.prepare(
     `UPDATE staff_members
-     SET rank_id = ?, last_group_rank_id = ?, sync_status = 'synced', last_synced_at = ?
+     SET rank_id = ?, last_group_rank_id = ?, roblox_membership_id = ?, sync_status = 'synced', last_synced_at = ?
      WHERE id = ?`
   )
-    .bind(rank.id, robloxRoleId, now(), existing.id)
+    .bind(rank.id, robloxRoleId, membershipId, now(), existing.id)
     .run();
 
   if (rankChanged) {
@@ -70,33 +93,35 @@ async function upsertStaffForRank(
   }
 }
 
-/**
- * Phase A — discover: walk every *configured* (mapped) rank and pull the
- * current member list for its Roblox role, upserting staff records.
- * We deliberately don't crawl the whole group membership — only roles an
- * admin has actually mapped to a RoarAdmin rank matter for staff purposes.
- */
-async function discoverFromMappedRanks(env: Env, org: Org) {
+/** Phase A — discover: walk every configured (mapped) rank and pull the current
+ * membership list for its Roblox role. We don't crawl the whole group -- only
+ * roles an admin has mapped to a RoarAdmin rank matter for staff purposes. */
+async function discoverFromMappedRanks(env: Env, org: Org, apiKey: string) {
   const ranks = await getMappedRanks(env, org.id);
 
   for (const rank of ranks) {
     if (rank.roblox_rank_id == null) continue;
-    for await (const member of iterateUsersInRole(org.roblox_group_id, rank.roblox_rank_id)) {
-      await upsertStaffForRank(env, org, rank, member.userId, member.username, rank.roblox_rank_id);
+    const filter = `role == 'groups/${org.roblox_group_id}/roles/${rank.roblox_rank_id}'`;
+
+    for await (const membership of iterateMemberships(apiKey, org.roblox_group_id, filter)) {
+      const userId = Number(membership.user.split("/").pop());
+      await upsertStaffForRank(
+        env,
+        org,
+        rank,
+        userId,
+        membershipIdFromPath(membership.path),
+        rank.roblox_rank_id
+      );
     }
   }
 }
 
-/**
- * Phase B — reconcile: for staff we already track (and haven't opted out
- * via rank_override), look up their *current* group role directly. Catches
- * promotions/demotions/removals that happened outside RoarAdmin.
- *
- * Per policy: if their new role doesn't map to any configured rank, we
- * DO NOT change their local rank_id — we only flag sync_status so an admin
- * can map it (or explicitly override). Nobody silently loses permissions.
- */
-async function reconcileExistingStaff(env: Env, org: Org) {
+/** Phase B — reconcile: for staff already tracked, look up their current membership
+ * directly, catching promotions/demotions/removals done outside RoarAdmin. An
+ * unmapped role never touches rank_id -- only sync_status, so nobody silently
+ * loses permissions; an admin has to resolve it. */
+async function reconcileExistingStaff(env: Env, org: Org, apiKey: string) {
   const ranks = await getMappedRanks(env, org.id);
   const rankByRobloxId = new Map(ranks.map((r) => [r.roblox_rank_id, r]));
 
@@ -107,10 +132,9 @@ async function reconcileExistingStaff(env: Env, org: Org) {
     .all<StaffMember>();
 
   for (const member of staff) {
-    const currentRole = await getUserRoleInGroup(member.roblox_user_id, org.roblox_group_id);
+    const membership = await findMembershipForUser(apiKey, org.roblox_group_id, member.roblox_user_id);
 
-    if (!currentRole) {
-      // Left the group entirely. Leave rank_id untouched, just flag it.
+    if (!membership) {
       await env.DB.prepare(
         "UPDATE staff_members SET sync_status = 'left_group', last_synced_at = ? WHERE id = ?"
       )
@@ -119,22 +143,21 @@ async function reconcileExistingStaff(env: Env, org: Org) {
       continue;
     }
 
-    // Already up to date, and their live role still maps cleanly.
-    if (currentRole.role.id === member.last_group_rank_id && member.sync_status === "synced") {
+    const currentRoleId = Number(roleIdFromPath(membership.role));
+
+    if (currentRoleId === member.last_group_rank_id && member.sync_status === "synced") {
       continue;
     }
 
-    const matchedRank = rankByRobloxId.get(currentRole.role.id);
+    const matchedRank = rankByRobloxId.get(currentRoleId);
 
     if (!matchedRank) {
-      // Their group role has no configured RoarAdmin rank. Leave them
-      // exactly as they are; just surface it for an admin to resolve.
       await env.DB.prepare(
         `UPDATE staff_members
-         SET last_group_rank_id = ?, sync_status = 'unmapped', last_synced_at = ?
+         SET last_group_rank_id = ?, roblox_membership_id = ?, sync_status = 'unmapped', last_synced_at = ?
          WHERE id = ?`
       )
-        .bind(currentRole.role.id, now(), member.id)
+        .bind(currentRoleId, membershipIdFromPath(membership.path), now(), member.id)
         .run();
       continue;
     }
@@ -142,10 +165,10 @@ async function reconcileExistingStaff(env: Env, org: Org) {
     if (matchedRank.id !== member.rank_id) {
       await env.DB.prepare(
         `UPDATE staff_members
-         SET rank_id = ?, last_group_rank_id = ?, sync_status = 'synced', last_synced_at = ?
+         SET rank_id = ?, last_group_rank_id = ?, roblox_membership_id = ?, sync_status = 'synced', last_synced_at = ?
          WHERE id = ?`
       )
-        .bind(matchedRank.id, currentRole.role.id, now(), member.id)
+        .bind(matchedRank.id, currentRoleId, membershipIdFromPath(membership.path), now(), member.id)
         .run();
 
       await env.DB.prepare(
@@ -156,9 +179,11 @@ async function reconcileExistingStaff(env: Env, org: Org) {
         .run();
     } else {
       await env.DB.prepare(
-        "UPDATE staff_members SET last_group_rank_id = ?, sync_status = 'synced', last_synced_at = ? WHERE id = ?"
+        `UPDATE staff_members
+         SET last_group_rank_id = ?, roblox_membership_id = ?, sync_status = 'synced', last_synced_at = ?
+         WHERE id = ?`
       )
-        .bind(currentRole.role.id, now(), member.id)
+        .bind(currentRoleId, membershipIdFromPath(membership.path), now(), member.id)
         .run();
     }
   }
@@ -166,27 +191,27 @@ async function reconcileExistingStaff(env: Env, org: Org) {
 
 /** Full sync for one org. Called on a Cron Trigger (fallback) and from the manual "sync now" button. */
 export async function syncOrgGroup(env: Env, org: Org) {
-  await discoverFromMappedRanks(env, org);
-  await reconcileExistingStaff(env, org);
+  const apiKey = await getOrgApiKey(env, org); // throws MissingApiKeyError if unset
+  await discoverFromMappedRanks(env, org, apiKey);
+  await reconcileExistingStaff(env, org, apiKey);
 }
 
-/**
- * Instant/"push" sync for a single staff member — call this right after any
- * action taken through RoarAdmin itself that changes someone's Roblox group
- * rank (e.g. a dashboard promotion), so the local record doesn't wait for
- * the next Cron tick.
- */
+/** Instant/"push" sync for a single staff member -- call right after any RoarAdmin
+ * action that changes someone's Roblox group rank, so the record doesn't wait for
+ * the next Cron tick. */
 export async function syncSingleStaffMember(env: Env, org: Org, staffId: string) {
   const member = await env.DB.prepare("SELECT * FROM staff_members WHERE id = ? AND org_id = ?")
     .bind(staffId, org.id)
     .first<StaffMember>();
   if (!member || member.rank_override) return;
 
+  const apiKey = await getOrgApiKey(env, org);
   const ranks = await getMappedRanks(env, org.id);
   const rankByRobloxId = new Map(ranks.map((r) => [r.roblox_rank_id, r]));
-  const currentRole = await getUserRoleInGroup(member.roblox_user_id, org.roblox_group_id);
 
-  if (!currentRole) {
+  const membership = await findMembershipForUser(apiKey, org.roblox_group_id, member.roblox_user_id);
+
+  if (!membership) {
     await env.DB.prepare(
       "UPDATE staff_members SET sync_status = 'left_group', last_synced_at = ? WHERE id = ?"
     )
@@ -195,23 +220,27 @@ export async function syncSingleStaffMember(env: Env, org: Org, staffId: string)
     return;
   }
 
-  const matchedRank = rankByRobloxId.get(currentRole.role.id);
+  const currentRoleId = Number(roleIdFromPath(membership.role));
+  const matchedRank = rankByRobloxId.get(currentRoleId);
+
   if (!matchedRank) {
     await env.DB.prepare(
       `UPDATE staff_members
-       SET last_group_rank_id = ?, sync_status = 'unmapped', last_synced_at = ?
+       SET last_group_rank_id = ?, roblox_membership_id = ?, sync_status = 'unmapped', last_synced_at = ?
        WHERE id = ?`
     )
-      .bind(currentRole.role.id, now(), member.id)
+      .bind(currentRoleId, membershipIdFromPath(membership.path), now(), member.id)
       .run();
     return;
   }
 
   await env.DB.prepare(
     `UPDATE staff_members
-     SET rank_id = ?, last_group_rank_id = ?, sync_status = 'synced', last_synced_at = ?
+     SET rank_id = ?, last_group_rank_id = ?, roblox_membership_id = ?, sync_status = 'synced', last_synced_at = ?
      WHERE id = ?`
   )
-    .bind(matchedRank.id, currentRole.role.id, now(), member.id)
+    .bind(matchedRank.id, currentRoleId, membershipIdFromPath(membership.path), now(), member.id)
     .run();
 }
+
+export { OpenCloudError };
